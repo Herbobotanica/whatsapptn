@@ -2,6 +2,7 @@
   "name": "herbo-whatsapp-notifications",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "start": "node api/sync-orders.js"
   }
