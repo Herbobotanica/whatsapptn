@@ -53,12 +53,29 @@ export default async function handler(req, res) {
     const tnText = await tnRes.text();
 
     if (!tnRes.ok) {
+      const tnError = safeJson(tnText);
+
+      // Tienda Nube puede devolver 404 "Last page is 0" cuando no hay resultados.
+      // Para nuestro flujo eso no es un error: significa que no hay órdenes nuevas.
+      if (
+        tnRes.status === 404 &&
+        tnError?.description === 'Last page is 0'
+      ) {
+        console.log('Sin órdenes nuevas enviadas. Tienda Nube devolvió Last page is 0.');
+
+        return res.status(200).json({
+          processed: 0,
+          errors: [],
+          detail: 'Sin órdenes nuevas enviadas'
+        });
+      }
+
       console.error('Error Tienda Nube:', tnText);
 
       return res.status(500).json({
         error: 'Error al consultar Tienda Nube',
         status: tnRes.status,
-        detail: safeJson(tnText)
+        detail: tnError
       });
     }
 
@@ -66,7 +83,11 @@ export default async function handler(req, res) {
 
     if (!Array.isArray(orders) || orders.length === 0) {
       console.log('Sin órdenes nuevas enviadas.');
-      return res.status(200).json({ processed: 0, errors: [] });
+
+      return res.status(200).json({
+        processed: 0,
+        errors: []
+      });
     }
 
     console.log(`Órdenes a procesar: ${orders.length}`);
@@ -253,12 +274,6 @@ async function findFreshworksContactIdByEmail(email) {
     return null;
   }
 
-  // Freshworks responde normalmente:
-  // {
-  //   "contacts": {
-  //     "contacts": [{ "id": 123, ... }]
-  //   }
-  // }
   const contacts = lookupData?.contacts?.contacts;
 
   if (Array.isArray(contacts) && contacts.length > 0) {
