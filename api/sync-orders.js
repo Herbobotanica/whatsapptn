@@ -1,7 +1,11 @@
 // ============================================================
 // Herbo Botánica — Sincronización automática de órdenes enviadas
 // Corre cada 10 minutos.
-// Flujo: Tienda Nube (órdenes "enviadas") → Freshworks CRM (contacto → lista) → Journey WhatsApp
+// Flujo:
+// Tienda Nube (órdenes "enviadas") 
+// → Freshworks CRM (contacto → campos → lista)
+// → Cerrar/archivar orden en Tienda Nube
+// → Journey WhatsApp se dispara desde Freshworks
 // ============================================================
 
 const TN_BASE = `https://api.tiendanube.com/v1/${process.env.TN_STORE_ID}`;
@@ -9,7 +13,6 @@ const FW_BASE = 'https://herbobotanica.myfreshworks.com/crm/sales/api';
 const LIST_ID = 27000020581; // Lista "Notificar Envio"
 
 export default async function handler(req, res) {
-  // Seguridad: solo aceptar llamadas con el CRON_SECRET correcto
   const secret = req.query.secret;
 
   if (secret !== process.env.CRON_SECRET) {
@@ -31,10 +34,9 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── 1. Traer órdenes enviadas en los últimos 30 minutos ──────────────
+    // ── 1. Traer órdenes enviadas/actualizadas en los últimos 30 minutos ──────────────
     const desde = new Date(Date.now() - 30 * 60 * 1000).toISOString();
 
-    // En las pruebas, Tienda Nube devolvió órdenes enviadas con "fulfilled".
     const tnUrl =
       `${TN_BASE}/orders?shipping_status=fulfilled` +
       `&updated_at_min=${encodeURIComponent(desde)}` +
@@ -43,11 +45,7 @@ export default async function handler(req, res) {
     console.log('Consultando Tienda Nube:', tnUrl);
 
     const tnRes = await fetch(tnUrl, {
-      headers: {
-        Authentication: `bearer ${process.env.TN_ACCESS_TOKEN}`,
-        'User-Agent': 'HerboBotanica (santacolomaeugenia@gmail.com)',
-        'Content-Type': 'application/json'
-      }
+      headers: tiendaNubeHeaders()
     });
 
     const tnText = await tnRes.text();
@@ -65,6 +63,8 @@ export default async function handler(req, res) {
 
         return res.status(200).json({
           processed: 0,
+          closed: 0,
+          skippedClosed: 0,
           errors: [],
           detail: 'Sin órdenes nuevas enviadas'
         });
@@ -86,19 +86,29 @@ export default async function handler(req, res) {
 
       return res.status(200).json({
         processed: 0,
+        closed: 0,
+        skippedClosed: 0,
         errors: []
       });
     }
 
-    console.log(`Órdenes a procesar: ${orders.length}`);
+    console.log(`Órdenes recibidas desde Tienda Nube: ${orders.length}`);
 
     let processed = 0;
+    let closed = 0;
+    let skippedClosed = 0;
     const errors = [];
 
     for (const order of orders) {
+      // Si ya está cerrada/archivada, no la procesamos de nuevo.
+      if (isOrderClosed(order)) {
+        console.log(`Orden #${order.number} ya está cerrada/archivada. Se saltea.`);
+        skippedClosed++;
+        continue;
+      }
+
       const customer = order.customer;
 
-      // Saltear si no tiene teléfono ni email
       if (!customer?.phone && !customer?.email) {
         console.log(`Orden #${order.number} sin teléfono ni email, se saltea.`);
 
@@ -111,118 +121,162 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const email = customer.email || '';
-      const phone = customer.phone?.replace(/\D/g, '') || '';
+      const email = customer.email || order.contact_email || '';
+      const phone = normalizePhone(customer.phone || order.contact_phone || '');
+      const orderCustomFields = getOrderCustomFields(order);
 
       try {
-        // ── 2. Buscar si el contacto ya existe en Freshworks CRM ─────────
-        // /contacts/search devolvía 404. El endpoint correcto probado es /lookup.
-        let existingContactId = null;
+        let contactId = null;
 
+        // 2. Buscar contacto existente por email.
         if (email) {
-          existingContactId = await findFreshworksContactIdByEmail(email);
+          contactId = await findFreshworksContactIdByEmail(email);
         }
 
-        if (existingContactId) {
-          // ── 3a. Contacto existe → agregar a la lista ─────────────────
-          const updateResult = await updateFreshworksContactList(existingContactId);
+        // 3. Si no existe, crear contacto con campos custom.
+        if (!contactId) {
+          const createResult = await createFreshworksContact({
+            firstName: getFirstName(order, customer),
+            lastName: getLastName(order, customer),
+            phone,
+            email,
+            customFields: orderCustomFields
+          });
 
-          if (!updateResult.ok) {
-            console.error(
-              `Error actualizando contacto orden #${order.number}:`,
-              updateResult.text
-            );
+          if (!createResult.ok) {
+            const duplicateByText = isDuplicateContactError(createResult.data);
 
-            errors.push({
-              order: order.number,
-              stage: 'freshworks_update_existing',
-              contactId: existingContactId,
-              status: updateResult.status,
-              error: safeJson(updateResult.text)
-            });
+            if (duplicateByText && email) {
+              const retryContactId = await findFreshworksContactIdByEmail(email);
 
-            continue;
-          }
-
-          console.log(
-            `✓ (actualizado) Orden #${order.number} — ${customer.first_name || ''} ${customer.last_name || ''}`
-          );
-
-          processed++;
-          continue;
-        }
-
-        // ── 3b. Contacto nuevo → crear y agregar a la lista ─────────────
-        const createRes = await fetch(`${FW_BASE}/contacts`, {
-          method: 'POST',
-          headers: freshworksHeaders(),
-          body: JSON.stringify({
-            contact: {
-              first_name: customer.first_name || '',
-              last_name: customer.last_name || '',
-              mobile_number: phone,
-              email,
-              contact_list_ids: [LIST_ID]
-            }
-          })
-        });
-
-        const createText = await createRes.text();
-        const createData = safeJson(createText);
-
-        if (!createRes.ok) {
-          // Si Freshworks dice que ya existe, intentamos buscarlo por email y actualizarlo.
-          const duplicateByText = isDuplicateContactError(createData);
-
-          if (duplicateByText && email) {
-            const retryContactId = await findFreshworksContactIdByEmail(email);
-
-            if (retryContactId) {
-              const updateResult = await updateFreshworksContactList(retryContactId);
-
-              if (!updateResult.ok) {
-                console.error(
-                  `Error actualizando contacto duplicado orden #${order.number}:`,
-                  updateResult.text
-                );
-
+              if (retryContactId) {
+                contactId = retryContactId;
+              } else {
                 errors.push({
                   order: order.number,
-                  stage: 'freshworks_update_after_duplicate_lookup',
-                  contactId: retryContactId,
-                  status: updateResult.status,
-                  error: safeJson(updateResult.text)
+                  stage: 'freshworks_duplicate_lookup_failed',
+                  status: createResult.status,
+                  error: createResult.data
                 });
 
                 continue;
               }
+            } else {
+              console.error(`Error creando contacto orden #${order.number}:`, createResult.text);
 
-              console.log(
-                `✓ (actualizado duplicado) Orden #${order.number} — ${customer.first_name || ''} ${customer.last_name || ''}`
-              );
+              errors.push({
+                order: order.number,
+                stage: 'freshworks_create',
+                status: createResult.status,
+                error: createResult.data
+              });
 
-              processed++;
               continue;
             }
-          }
+          } else {
+            contactId = extractCreatedContactId(createResult.data);
 
-          console.error(`Error creando contacto orden #${order.number}:`, createText);
+            if (!contactId) {
+              errors.push({
+                order: order.number,
+                stage: 'freshworks_create_no_id',
+                error: createResult.data
+              });
+
+              continue;
+            }
+
+            console.log(
+              `✓ Contacto creado - Orden #${order.number} — Contact ID ${contactId}`
+            );
+          }
+        } else {
+          console.log(
+            `✓ Contacto existente encontrado - Orden #${order.number} — Contact ID ${contactId}`
+          );
+        }
+
+        // 4. Actualizar campos custom del contacto:
+        //    Medio de envío, tracking y número de orden.
+        const updateFieldsResult = await updateFreshworksContactCustomFields(
+          contactId,
+          orderCustomFields
+        );
+
+        if (!updateFieldsResult.ok) {
+          console.error(
+            `Error actualizando campos del contacto orden #${order.number}:`,
+            updateFieldsResult.text
+          );
 
           errors.push({
             order: order.number,
-            stage: 'freshworks_create',
-            status: createRes.status,
-            error: createData
+            stage: 'freshworks_update_custom_fields',
+            contactId,
+            status: updateFieldsResult.status,
+            error: safeJson(updateFieldsResult.text)
           });
 
           continue;
         }
 
         console.log(
-          `✓ (creado) Orden #${order.number} — ${customer.first_name || ''} ${customer.last_name || ''}`
+          `✓ Campos actualizados - Orden #${order.number} — Medio: ${orderCustomFields.cf_medio_de_envio || '-'} — Tracking: ${orderCustomFields.cf_tracking_correo_argentino || '-'}`
+        );
+
+        // 5. Agregar contacto a la lista "Notificar Envio".
+        const addListResult = await addFreshworksContactToList(contactId);
+
+        if (!addListResult.ok) {
+          console.error(
+            `Error agregando contacto a lista orden #${order.number}:`,
+            addListResult.text
+          );
+
+          errors.push({
+            order: order.number,
+            stage: 'freshworks_add_to_list',
+            contactId,
+            listId: LIST_ID,
+            status: addListResult.status,
+            error: safeJson(addListResult.text)
+          });
+
+          continue;
+        }
+
+        console.log(
+          `✓ Contacto agregado a lista Notificar Envio - Orden #${order.number} — Contact ID ${contactId}`
+        );
+
+        // 6. Solo si Freshworks salió OK, cerramos/archivamos la orden en Tienda Nube.
+        const closeResult = await closeTiendaNubeOrder(order.id);
+
+        if (!closeResult.ok) {
+          console.error(
+            `Error cerrando/archivando orden #${order.number}:`,
+            closeResult.text
+          );
+
+          errors.push({
+            order: order.number,
+            stage: 'tiendanube_close_order',
+            orderId: order.id,
+            status: closeResult.status,
+            error: safeJson(closeResult.text)
+          });
+
+          // Ojo: Freshworks ya se procesó OK, pero la orden no se pudo archivar.
+          // La dejamos como error para poder detectarlo.
+          continue;
+        }
+
+        console.log(
+          `✓ Orden cerrada/archivada en Tienda Nube - Orden #${order.number} — Order ID ${order.id}`
         );
 
         processed++;
+        closed++;
       } catch (innerErr) {
         console.error(`Error procesando orden #${order.number}:`, innerErr.message);
 
@@ -236,6 +290,8 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       processed,
+      closed,
+      skippedClosed,
       errors
     });
   } catch (error) {
@@ -247,12 +303,106 @@ export default async function handler(req, res) {
   }
 }
 
+// ============================================================
+// Headers
+// ============================================================
+
+function tiendaNubeHeaders() {
+  return {
+    Authentication: `bearer ${process.env.TN_ACCESS_TOKEN}`,
+    'User-Agent': 'HerboBotanica (santacolomaeugenia@gmail.com)',
+    'Content-Type': 'application/json'
+  };
+}
+
 function freshworksHeaders() {
   return {
     Authorization: `Token token=${process.env.FRESHWORKS_API_KEY}`,
     'Content-Type': 'application/json'
   };
 }
+
+// ============================================================
+// Tienda Nube helpers
+// ============================================================
+
+function isOrderClosed(order) {
+  return Boolean(order.closed_at) || order.status === 'closed';
+}
+
+async function closeTiendaNubeOrder(orderId) {
+  const closeRes = await fetch(`${TN_BASE}/orders/${orderId}/close`, {
+    method: 'POST',
+    headers: tiendaNubeHeaders()
+  });
+
+  const text = await closeRes.text();
+
+  return {
+    ok: closeRes.ok,
+    status: closeRes.status,
+    text
+  };
+}
+
+// ============================================================
+// Campos custom Freshworks
+// ============================================================
+
+function getOrderCustomFields(order) {
+  return {
+    cf_medio_de_envio: getShippingMethod(order),
+    cf_tracking_correo_argentino: getTrackingNumber(order),
+    cf_n_de_orden: order.number ? String(order.number) : ''
+  };
+}
+
+function getShippingMethod(order) {
+  return (
+    order.shipping_option ||
+    order.fulfillments?.[0]?.shipping?.option?.name ||
+    order.shipping_carrier_name ||
+    ''
+  );
+}
+
+function getTrackingNumber(order) {
+  return (
+    order.shipping_tracking_number ||
+    order.fulfillments?.[0]?.tracking_info?.code ||
+    ''
+  );
+}
+
+// ============================================================
+// Datos básicos contacto
+// ============================================================
+
+function normalizePhone(phone) {
+  return phone ? phone.replace(/\D/g, '') : '';
+}
+
+function getFirstName(order, customer) {
+  if (customer.first_name) return customer.first_name;
+
+  const name = customer.name || order.contact_name || '';
+  return name.trim().split(' ')[0] || '';
+}
+
+function getLastName(order, customer) {
+  if (customer.last_name) return customer.last_name;
+
+  const name = customer.name || order.contact_name || '';
+  const parts = name.trim().split(' ');
+
+  if (parts.length <= 1) return '';
+
+  return parts.slice(1).join(' ');
+}
+
+// ============================================================
+// Freshworks CRM
+// ============================================================
 
 async function findFreshworksContactIdByEmail(email) {
   const lookupUrl =
@@ -283,13 +433,39 @@ async function findFreshworksContactIdByEmail(email) {
   return null;
 }
 
-async function updateFreshworksContactList(contactId) {
+async function createFreshworksContact({ firstName, lastName, phone, email, customFields }) {
+  const createRes = await fetch(`${FW_BASE}/contacts`, {
+    method: 'POST',
+    headers: freshworksHeaders(),
+    body: JSON.stringify({
+      contact: {
+        first_name: firstName,
+        last_name: lastName,
+        mobile_number: phone,
+        email,
+        custom_field: customFields
+      }
+    })
+  });
+
+  const text = await createRes.text();
+  const data = safeJson(text);
+
+  return {
+    ok: createRes.ok,
+    status: createRes.status,
+    text,
+    data
+  };
+}
+
+async function updateFreshworksContactCustomFields(contactId, customFields) {
   const updateRes = await fetch(`${FW_BASE}/contacts/${contactId}`, {
     method: 'PUT',
     headers: freshworksHeaders(),
     body: JSON.stringify({
       contact: {
-        contact_list_ids: [LIST_ID]
+        custom_field: customFields
       }
     })
   });
@@ -301,6 +477,40 @@ async function updateFreshworksContactList(contactId) {
     status: updateRes.status,
     text
   };
+}
+
+async function addFreshworksContactToList(contactId) {
+  const addRes = await fetch(`${FW_BASE}/lists/${LIST_ID}/add_contacts`, {
+    method: 'PUT',
+    headers: freshworksHeaders(),
+    body: JSON.stringify({
+      ids: [contactId]
+    })
+  });
+
+  const text = await addRes.text();
+
+  return {
+    ok: addRes.ok,
+    status: addRes.status,
+    text
+  };
+}
+
+// ============================================================
+// Utilidades
+// ============================================================
+
+function extractCreatedContactId(data) {
+  if (data?.contact?.id) {
+    return data.contact.id;
+  }
+
+  if (data?.id) {
+    return data.id;
+  }
+
+  return null;
 }
 
 function isDuplicateContactError(errorData) {
