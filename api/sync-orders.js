@@ -290,6 +290,7 @@ async function fetchTiendaNubeShippedOrders() {
   while (true) {
     const tnUrl =
       `${TN_BASE}/orders?shipping_status=fulfilled` +
+      `&status=open` +
       `&per_page=${perPage}` +
       `&page=${page}`;
 
