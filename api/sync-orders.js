@@ -35,8 +35,8 @@ export default async function handler(req, res) {
     }
 
     // ── 1. Traer órdenes enviadas/actualizadas en los últimos 30 minutos ──────────────
-    const desde = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-
+    const desde = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    
     const tnUrl =
       `${TN_BASE}/orders?shipping_status=fulfilled` +
       `&updated_at_min=${encodeURIComponent(desde)}` +
