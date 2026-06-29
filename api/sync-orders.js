@@ -455,6 +455,10 @@ async function createFreshworksContact({ firstName, lastName, phone, email, cust
         last_name: lastName,
         mobile_number: phone,
         email,
+
+        // Siempre dejar suscripto a WhatsApp
+        whatsapp_subscription_status: 1,
+
         custom_field: customFields
       }
     })
@@ -477,6 +481,9 @@ async function updateFreshworksContactCustomFields(contactId, customFields) {
     headers: freshworksHeaders(),
     body: JSON.stringify({
       contact: {
+        // Siempre dejar suscripto a WhatsApp
+        whatsapp_subscription_status: 1,
+
         custom_field: customFields
       }
     })
