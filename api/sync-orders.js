@@ -2,8 +2,8 @@
 // Herbo Botánica — Sincronización automática de órdenes enviadas
 // Corre cada 10 minutos.
 // Flujo:
-// Tienda Nube (órdenes "enviadas") 
-// → Freshworks CRM (contacto → campos → lista)
+// Tienda Nube órdenes enviadas, sin filtro de fecha
+// → Freshworks CRM contacto + campos + lista
 // → Cerrar/archivar orden en Tienda Nube
 // → Journey WhatsApp se dispara desde Freshworks
 // ============================================================
@@ -34,57 +34,14 @@ export default async function handler(req, res) {
       });
     }
 
-    // ── 1. Traer órdenes enviadas/actualizadas en los últimos 30 minutos ──────────────
-    const desde = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-    
-    const tnUrl =
-      `${TN_BASE}/orders?shipping_status=fulfilled` +
-      `&updated_at_min=${encodeURIComponent(desde)}` +
-      `&per_page=50`;
-
-    console.log('Consultando Tienda Nube:', tnUrl);
-
-    const tnRes = await fetch(tnUrl, {
-      headers: tiendaNubeHeaders()
-    });
-
-    const tnText = await tnRes.text();
-
-    if (!tnRes.ok) {
-      const tnError = safeJson(tnText);
-
-      // Tienda Nube puede devolver 404 "Last page is 0" cuando no hay resultados.
-      // Para nuestro flujo eso no es un error: significa que no hay órdenes nuevas.
-      if (
-        tnRes.status === 404 &&
-        tnError?.description === 'Last page is 0'
-      ) {
-        console.log('Sin órdenes nuevas enviadas. Tienda Nube devolvió Last page is 0.');
-
-        return res.status(200).json({
-          processed: 0,
-          closed: 0,
-          skippedClosed: 0,
-          errors: [],
-          detail: 'Sin órdenes nuevas enviadas'
-        });
-      }
-
-      console.error('Error Tienda Nube:', tnText);
-
-      return res.status(500).json({
-        error: 'Error al consultar Tienda Nube',
-        status: tnRes.status,
-        detail: tnError
-      });
-    }
-
-    const orders = safeJson(tnText);
+    // ── 1. Traer todas las órdenes enviadas, sin filtrar por fecha ──────────────
+    const orders = await fetchTiendaNubeShippedOrders();
 
     if (!Array.isArray(orders) || orders.length === 0) {
-      console.log('Sin órdenes nuevas enviadas.');
+      console.log('Sin órdenes enviadas pendientes.');
 
       return res.status(200).json({
+        received: 0,
         processed: 0,
         closed: 0,
         skippedClosed: 0,
@@ -92,7 +49,7 @@ export default async function handler(req, res) {
       });
     }
 
-    console.log(`Órdenes recibidas desde Tienda Nube: ${orders.length}`);
+    console.log(`Órdenes enviadas recibidas desde Tienda Nube: ${orders.length}`);
 
     let processed = 0;
     let closed = 0;
@@ -109,7 +66,7 @@ export default async function handler(req, res) {
 
       const customer = order.customer;
 
-      if (!customer?.phone && !customer?.email) {
+      if (!customer?.phone && !customer?.email && !order.contact_email && !order.contact_phone) {
         console.log(`Orden #${order.number} sin teléfono ni email, se saltea.`);
 
         errors.push({
@@ -121,8 +78,8 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const email = customer.email || order.contact_email || '';
-      const phone = normalizePhone(customer.phone || order.contact_phone || '');
+      const email = customer?.email || order.contact_email || '';
+      const phone = normalizePhone(customer?.phone || order.contact_phone || '');
       const orderCustomFields = getOrderCustomFields(order);
 
       try {
@@ -136,8 +93,8 @@ export default async function handler(req, res) {
         // 3. Si no existe, crear contacto con campos custom.
         if (!contactId) {
           const createResult = await createFreshworksContact({
-            firstName: getFirstName(order, customer),
-            lastName: getLastName(order, customer),
+            firstName: getFirstName(order, customer || {}),
+            lastName: getLastName(order, customer || {}),
             phone,
             email,
             customFields: orderCustomFields
@@ -266,8 +223,6 @@ export default async function handler(req, res) {
             error: safeJson(closeResult.text)
           });
 
-          // Ojo: Freshworks ya se procesó OK, pero la orden no se pudo archivar.
-          // La dejamos como error para poder detectarlo.
           continue;
         }
 
@@ -289,6 +244,7 @@ export default async function handler(req, res) {
     }
 
     return res.status(200).json({
+      received: orders.length,
       processed,
       closed,
       skippedClosed,
@@ -323,8 +279,63 @@ function freshworksHeaders() {
 }
 
 // ============================================================
-// Tienda Nube helpers
+// Tienda Nube
 // ============================================================
+
+async function fetchTiendaNubeShippedOrders() {
+  const allOrders = [];
+  let page = 1;
+  const perPage = 50;
+
+  while (true) {
+    const tnUrl =
+      `${TN_BASE}/orders?shipping_status=fulfilled` +
+      `&per_page=${perPage}` +
+      `&page=${page}`;
+
+    console.log(`Consultando Tienda Nube página ${page}:`, tnUrl);
+
+    const tnRes = await fetch(tnUrl, {
+      headers: tiendaNubeHeaders()
+    });
+
+    const tnText = await tnRes.text();
+    const tnData = safeJson(tnText);
+
+    if (!tnRes.ok) {
+      if (
+        tnRes.status === 404 &&
+        tnData?.description === 'Last page is 0'
+      ) {
+        console.log(`Tienda Nube página ${page}: sin resultados.`);
+        break;
+      }
+
+      throw new Error(
+        `Error Tienda Nube página ${page}: ${tnRes.status} - ${tnText}`
+      );
+    }
+
+    if (!Array.isArray(tnData) || tnData.length === 0) {
+      console.log(`Tienda Nube página ${page}: respuesta vacía.`);
+      break;
+    }
+
+    allOrders.push(...tnData);
+
+    console.log(
+      `Tienda Nube página ${page}: ${tnData.length} órdenes recibidas. Total acumulado: ${allOrders.length}`
+    );
+
+    if (tnData.length < perPage) {
+      break;
+    }
+
+    page++;
+  }
+
+  return allOrders;
+}
 
 function isOrderClosed(order) {
   return Boolean(order.closed_at) || order.status === 'closed';
